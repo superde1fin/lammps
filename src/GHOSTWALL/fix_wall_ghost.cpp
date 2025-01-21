@@ -25,6 +25,7 @@
 #include "force.h"
 #include "atom.h"
 #include "neigh_list.h"
+#include "memory.h"
 
 
 #include <cstring>
@@ -37,14 +38,27 @@ enum { XLO = 0, XHI = 1, YLO = 2, YHI = 3, ZLO = 4, ZHI = 5 };
 
 static const char *wallpos[] = {"xlo", "xhi", "ylo", "yhi", "zlo", "zhi"};
 
+// Static or global bitwise OR function
+void FixWallGhost::bitwise_or(void *invec, void *inoutvec, int *len, MPI_Datatype *datatype) {
+    unsigned char *in = static_cast<unsigned char *>(invec);
+    unsigned char *inout = static_cast<unsigned char *>(inoutvec);
+
+    for (int i = 0; i < *len; i++) {
+        inout[i] |= in[i]; // Perform bitwise OR
+    }
+}
+
 /* ---------------------------------------------------------------------- */
 
-FixWallGhost::FixWallGhost(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg), nwall(0)
+FixWallGhost::FixWallGhost(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, arg), nwall(0), lmp(lmp)
 {
   virial_global_flag = virial_peratom_flag = 1;
   respa_level_support = 1;
   ilevel_respa = 0;
   dynamic_group_allow = 1;
+  filled_before = false;
+
+  MPI_Op_create(&bitwise_or, 1, &mpi_bor_custom);
 
   // parse args
 
@@ -55,7 +69,7 @@ FixWallGhost::FixWallGhost(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, a
   int iarg = 3;
 
   while (iarg < narg) {
-    int wantargs = 3;
+    int wantargs = 4;
 
     if ((strcmp(arg[iarg], "xlo") == 0) || (strcmp(arg[iarg], "xhi") == 0) ||
         (strcmp(arg[iarg], "ylo") == 0) || (strcmp(arg[iarg], "yhi") == 0) ||
@@ -100,6 +114,7 @@ FixWallGhost::FixWallGhost(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, a
       }
 
       cutoff[nwall] = utils::numeric(FLERR, arg[iarg + 2], false, lmp);
+      every[nwall] = utils::numeric(FLERR, arg[iarg + 3], false, lmp);
 
       nwall++;
       iarg += wantargs;
@@ -156,7 +171,6 @@ FixWallGhost::FixWallGhost(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, a
   }
 
   // set varflag if any wall positions or parameters are variable
-  // set wstyle to VARIABLE if either epsilon or sigma is a variable
 
   varflag = 0;
   for (int m = 0; m < nwall; m++) {
@@ -173,7 +187,13 @@ FixWallGhost::~FixWallGhost()
 
   for (int m = 0; m < nwall; m++) {
     delete[] xstr[m];
+    xstr[m] = nullptr;
+    if (rel2wall[m]){
+      lmp->memory->destroy(rel2wall[m]);
+      rel2wall[m] = nullptr;
+    }
   }
+  MPI_Op_free(&mpi_bor_custom);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -211,6 +231,8 @@ void FixWallGhost::init()
 
 void FixWallGhost::setup(int vflag)
 {
+  initial_timestep = update->ntimestep;
+
   if (utils::strmatch(update->integrate_style, "^verlet")) {
   } else {
     (dynamic_cast<Respa *>(update->integrate))->copy_flevel_f(ilevel_respa);
@@ -259,7 +281,7 @@ void FixWallGhost::post_force(int vflag)
         coord *= zscale;
     } else
       coord = coord0[m];
-    wall_particle(m, wallwhich[m], coord);
+    wall_particle(m, coord);
   }
 
   if (varflag) modify->addstep_compute(update->ntimestep + 1);
@@ -279,27 +301,65 @@ void FixWallGhost::min_post_force(int vflag)
   post_force(vflag);
 }
 
-void FixWallGhost::wall_particle(int m, int which, double coord)
+void FixWallGhost::wall_particle(int m, double coord)
 {
-  int inum = force->pair->list->inum;
-  int *ilist = force->pair->list->ilist;
-  int *numneigh = force->pair->list->numneigh;
-  int **firstneigh = force->pair->list->firstneigh;
 
-  int dim = which / 2;
 
-  double **x = atom->x;
-  int *mask = atom->mask;
+  inum = force->pair->list->inum;
+  ilist = force->pair->list->ilist;
+  numneigh = force->pair->list->numneigh;
+  firstneigh = force->pair->list->firstneigh;
+
+  int dim = wallwhich[m] / 2;
+
+  x = atom->x;
+  mask = atom->mask;
 
   int i, j, ii, jj, jnum, mask_index;
   int *jlist;
+  tagint *tag = lmp->atom->tag;
 
-  std::unordered_set<int> to_mask; //This set holds local ids of neighboring atoms of each atom in question that will be masked because of being on an opposite side of the wall
+  bool reset_wall_memory = (every[m] == -1 && !filled_before) || 
+                         (!every[m]) || 
+                         (!((update->ntimestep - initial_timestep) % every[m]));
+
+  if (reset_wall_memory){
+    int all_atoms_count = 27*atom->natoms; //Ensure all ghost atoms are included as well
+
+    lmp->memory->create(rel2wall[m], all_atoms_count, "ghostwall:rel2wall");
+    std::fill(rel2wall[m], rel2wall[m] + all_atoms_count, false);
+    for (i = 0; i < atom->nlocal; i++){
+      
+      rel2wall[m][27*(tag[i] - 1) + get_ghost_offset(x[i])] = (x[i][dim] - coord < 0);
+    }
+
+    // Pack bool array into unsigned chars
+    int packed_size = (all_atoms_count + 7) / 8; // Number of bytes needed
+    std::vector<unsigned char> packed(packed_size, 0);
+
+    for (int i = 0; i < all_atoms_count; i++) {
+        if (rel2wall[m][i]) {
+            packed[i / 8] |= (1 << (i % 8)); // Set the corresponding bit
+        }
+    }
+    
+    // Perform MPI_Allreduce on the packed data
+    MPI_Allreduce(MPI_IN_PLACE, packed.data(), packed_size, MPI_BYTE, MPI_LOR, lmp->world);
+
+    // Unpack the data back into the bool array
+    for (int i = 0; i < all_atoms_count; i++) {
+        rel2wall[m][i] = packed[i / 8] & (1 << (i % 8));
+    }
+
+  filled_before = true;
+  }
+
+  std::unordered_set<int> to_mask; //Local ids of neighboring atoms of each atom in question that will be masked because of being on an opposite side of the wall
 
   for (ii = 0; ii < inum; ii++) {
     to_mask.clear();
     i = ilist[ii];
-    //printf("Wall scanning atom %d\n", i); 
+    if (std::abs(x[i][dim] - coord) > cutoff[m]) continue;
 
     if (mask[i] & groupbit){
       jnum = numneigh[i];
@@ -308,12 +368,11 @@ void FixWallGhost::wall_particle(int m, int which, double coord)
       for (jj = 0; jj < jnum; jj++){
         j = jlist[jj];
         j &= NEIGHMASK;
-        //printf("Wall scanning neighbor %d\n", j); 
+        if (std::abs(x[j][dim] - coord) > cutoff[m]) continue;
 
         if (mask[j] & groupbit){
-          //printf("Dist of atoms %f, %f\n", x[i][dim] - coord, x[j][dim] - coord);
-          if ((x[i][dim] - coord < 0)^(x[j][dim] - coord < 0)){
-            //printf("Atoms %d and %d are separated by ghostwall\n", i, j);
+          //if ((x[i][dim] - coord < 0)^(x[j][dim] - coord < 0)){
+          if (rel2wall[m][27*(tag[i] - 1) + get_ghost_offset(x[i])] ^ rel2wall[m][27*(tag[j] - 1) + get_ghost_offset(x[j])]){
             to_mask.emplace(j);
           }
         }
@@ -328,8 +387,23 @@ void FixWallGhost::wall_particle(int m, int which, double coord)
       }
     }
   }
+  
 }
 
 void FixWallGhost::setup_pre_force(int vflag) {
+    initial_timestep = update->ntimestep;
     post_force(vflag);
 }
+
+int FixWallGhost::get_ghost_offset(double *atom_x){
+    // Determine the offset in each direction (dx, dy, dz)
+    int dx = (atom_x[0] < domain->boxlo[0]) ? -1 : ((atom_x[0] >= domain->boxhi[0]) ? 1 : 0);
+    int dy = (atom_x[1] < domain->boxlo[1]) ? -1 : ((atom_x[1] >= domain->boxhi[1]) ? 1 : 0);
+    int dz = (atom_x[2] < domain->boxlo[2]) ? -1 : ((atom_x[2] >= domain->boxhi[2]) ? 1 : 0);
+
+    // Encode the ghost offset into a single value from 0 to 26
+    int ghost_offset = (dx + 1) * 9 + (dy + 1) * 3 + (dz + 1);
+
+    return ghost_offset;
+    }
+
