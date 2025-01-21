@@ -234,6 +234,7 @@ void FixWallGhost::setup(int vflag)
   initial_timestep = update->ntimestep;
 
   if (utils::strmatch(update->integrate_style, "^verlet")) {
+    post_force(vflag);
   } else {
     (dynamic_cast<Respa *>(update->integrate))->copy_flevel_f(ilevel_respa);
     post_force_respa(vflag, ilevel_respa, 0);
