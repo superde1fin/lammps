@@ -35,6 +35,7 @@ class Region : protected Pointers {
   int openflag;                // 1 if any face is open
   int open_faces[6];           // flags for which faces are open
 
+  int full_volume; //Flag specifying whether the inside and outside of a region make up the whole space
   int copymode;    // 1 if copy of original class
 
   // contact = particle near region surface (for soft interactions)
@@ -95,6 +96,7 @@ class Region : protected Pointers {
   virtual void pretransform();
   virtual void set_velocity_shape() {}
   virtual void velocity_contact_shape(double *, double *) {}
+  virtual bool across_partial(double, double, double, double, double, double){return false;}
 
  protected:
   void add_contact(int, double *, double, double, double);

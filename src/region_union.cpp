@@ -131,12 +131,16 @@ void RegUnion::init()
 
 int RegUnion::inside(double x, double y, double z)
 {
-  int ilist;
-  for (ilist = 0; ilist < nregion; ilist++)
-    if (reglist[ilist]->match(x, y, z)) break;
+  int ilist, reg_match, all_excluded;
+  for (ilist = 0; ilist < nregion; ilist++){
+    reg_match = reglist[ilist]->match(x, y, z);
+    if (reg_match == 1) break;
+    if (reg_match == 0) all_excluded = 0;
+  }
 
-  if (ilist == nregion) return 0;
-  return 1;
+  if (all_excluded && ilist == nregion) return -1;
+  else if (ilist == nregion) return 0;
+  else return 1;
 }
 
 /* ----------------------------------------------------------------------

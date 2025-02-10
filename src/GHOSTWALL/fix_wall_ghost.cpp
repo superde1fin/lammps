@@ -30,6 +30,7 @@
 
 #include <cstring>
 #include <unordered_set>
+#include <vector>
 
 using namespace LAMMPS_NS;
 using namespace FixConst;
@@ -56,9 +57,23 @@ FixWallGhost::FixWallGhost(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, a
   respa_level_support = 1;
   ilevel_respa = 0;
   dynamic_group_allow = 1;
-  filled_before = false;
+
+  if (!domain->boundary[0][0] && !domain->boundary[1][0] && !domain->boundary[2][0]){
+    ghost_dimensions = 13;
+  } else if (!domain->boundary[0][0] && !domain->boundary[1][0] || !domain->boundary[0][0] && !domain->boundary[2][0] || !domain->boundary[1][0] && !domain->boundary[2][0]){
+    ghost_dimensions = 4;
+  } else if (!domain->boundary[0][0] || !domain->boundary[1][0] || !domain->boundary[2][0]){
+    ghost_dimensions = 1;
+  } else {
+    ghost_dimensions = 0;
+  }
+
+
 
   MPI_Op_create(&bitwise_or, 1, &mpi_bor_custom);
+
+  for (int i = 0; i < modify->nfix; i++)
+    printf("See fix: %s\n", modify->fix[i]->id);
 
   // parse args
 
@@ -66,7 +81,7 @@ FixWallGhost::FixWallGhost(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, a
 
   for (int i = 0; i < 6; i++) xstr[i] = nullptr;
 
-  int iarg = 3;
+  int iarg = 3, ifix;
 
   while (iarg < narg) {
     int wantargs = 4;
@@ -115,6 +130,8 @@ FixWallGhost::FixWallGhost(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, a
 
       cutoff[nwall] = utils::numeric(FLERR, arg[iarg + 2], false, lmp);
       every[nwall] = utils::numeric(FLERR, arg[iarg + 3], false, lmp);
+      rel2wall[nwall] = nullptr;
+      filled_before[nwall] = false;
 
       nwall++;
       iarg += wantargs;
@@ -127,11 +144,28 @@ FixWallGhost::FixWallGhost(LAMMPS *lmp, int narg, char **arg) : Fix(lmp, narg, a
       else
         error->all(FLERR, "Illegal fix {} command", style);
       iarg += 2;
+    } else if (strcmp(arg[iarg], "append") == 0) {
+      for (ifix = 0; ifix < modify->nfix; ifix++){
+        if(modify->fix[ifix] != nullptr){
+          if(strcmp(arg[iarg + 1], modify->fix[ifix]->id) == 0) break;
+		}
+      }
+      if (ifix < modify->nfix){
+	    if (strcmp(modify->fix[ifix]->style, "wall/ghost") == 0){
+          FixWallGhost *fixGW = dynamic_cast<FixWallGhost*>(modify->fix[ifix]);
+          append_flag = 1;
+          wall_save[nwall] = fixGW->rel2wall[fixGW->wallwhich[nwall]];
+        } else {
+          error->all(FLERR, "Initial fix has to be style wall/ghost and not {}", modify->fix[ifix]->style); 
+        }
+	  } else { 
+        error->all(FLERR, "No fix with name {} was found", arg[iarg + 1]); 
+      }
+      iarg += 2;
     } else
       error->all(FLERR, "Illegal fix {} command", style);
   }
 
-  size_vector = nwall;
 
   // error checks
 
@@ -233,9 +267,7 @@ void FixWallGhost::setup(int vflag)
 {
   initial_timestep = update->ntimestep;
 
-  if (utils::strmatch(update->integrate_style, "^verlet")) {
-    post_force(vflag);
-  } else {
+  if (!utils::strmatch(update->integrate_style, "^verlet")) {
     (dynamic_cast<Respa *>(update->integrate))->copy_flevel_f(ilevel_respa);
     post_force_respa(vflag, ilevel_respa, 0);
     (dynamic_cast<Respa *>(update->integrate))->copy_f_flevel(ilevel_respa);
@@ -302,6 +334,40 @@ void FixWallGhost::min_post_force(int vflag)
   post_force(vflag);
 }
 
+
+void FixWallGhost::set_wall_memory(int m, int dim, double coord){
+  int all_atoms_count = (ghost_dimensions + 1)*atom->natoms; //Ensure all ghost atoms are included as well
+  int i, rel_ind;
+  
+  if (rel2wall[m] == nullptr) lmp->memory->create(rel2wall[m], all_atoms_count, "ghostwall:rel2wall");
+
+  std::fill(rel2wall[m], rel2wall[m] + all_atoms_count, false);
+
+  for (i = 0; i < atom->nlocal; i++){
+      if (x[i][0] > 2*domain->boxhi[0] - domain->boxlo[0] || x[i][0] < 2*domain->boxlo[0] - domain->boxhi[0] || x[i][1] > 2*domain->boxhi[0] - domain->boxlo[1] || x[i][1] < 2*domain->boxlo[1] - domain->boxhi[1] || x[i][2] > 2*domain->boxhi[2] - domain->boxlo[2] || x[i][2] < 2*domain->boxlo[2] - domain->boxhi[2]){
+      error->all(FLERR, "Fix style wall/ghost/region does not support the use of second set of ghost atoms. Reduce your cutoff");
+    }
+	rel_ind =  (ghost_dimensions + 1)*(tag[i] - 1) + get_ghost_offset(x[i]);
+    rel2wall[m][rel_ind] = (x[i][dim] - coord < 0) && (!append_flag || wall_save[m][rel_ind]);
+  }
+
+  int packed_size = (all_atoms_count + 7) / 8; // Number of bytes needed
+  std::vector<unsigned char> packed(packed_size, 0);
+
+  for (int i = 0; i < all_atoms_count; i++) {
+      packed[i / 8] |= rel2wall[m][i] << (i % 8);
+  }
+  
+  // Perform MPI_Allreduce on the packed data
+  MPI_Allreduce(MPI_IN_PLACE, packed.data(), packed_size, MPI_BYTE, mpi_bor_custom, lmp->world);
+
+  // Unpack the data back into the bool array
+  for (int i = 0; i < all_atoms_count; i++) {
+    rel2wall[m][i] = (packed[i / 8] >> (i % 8)) & 1;
+  }
+
+}
+
 void FixWallGhost::wall_particle(int m, double coord)
 {
 
@@ -316,43 +382,19 @@ void FixWallGhost::wall_particle(int m, double coord)
   x = atom->x;
   mask = atom->mask;
 
-  int i, j, ii, jj, jnum, mask_index;
+  int i, j, ii, jj, jnum, mask_index, atm1, atm2;
   int *jlist;
-  tagint *tag = lmp->atom->tag;
+  tag = lmp->atom->tag;
 
-  bool reset_wall_memory = (every[m] == -1 && !filled_before) || 
-                         (!every[m]) || 
-                         (!((update->ntimestep - initial_timestep) % every[m]));
+  bool reset_wall_memory;
+  if (every[m] == -1) reset_wall_memory = !filled_before[m];
+  else if (!every[m]) reset_wall_memory = true;
+  else if (!((update->ntimestep - initial_timestep) % every[m])) reset_wall_memory = true;
+
 
   if (reset_wall_memory){
-    int all_atoms_count = 27*atom->natoms; //Ensure all ghost atoms are included as well
-
-    lmp->memory->create(rel2wall[m], all_atoms_count, "ghostwall:rel2wall");
-    std::fill(rel2wall[m], rel2wall[m] + all_atoms_count, false);
-    for (i = 0; i < atom->nlocal; i++){
-      
-      rel2wall[m][27*(tag[i] - 1) + get_ghost_offset(x[i])] = (x[i][dim] - coord < 0);
-    }
-
-    // Pack bool array into unsigned chars
-    int packed_size = (all_atoms_count + 7) / 8; // Number of bytes needed
-    std::vector<unsigned char> packed(packed_size, 0);
-
-    for (int i = 0; i < all_atoms_count; i++) {
-        if (rel2wall[m][i]) {
-            packed[i / 8] |= (1 << (i % 8)); // Set the corresponding bit
-        }
-    }
-    
-    // Perform MPI_Allreduce on the packed data
-    MPI_Allreduce(MPI_IN_PLACE, packed.data(), packed_size, MPI_BYTE, MPI_LOR, lmp->world);
-
-    // Unpack the data back into the bool array
-    for (int i = 0; i < all_atoms_count; i++) {
-        rel2wall[m][i] = packed[i / 8] & (1 << (i % 8));
-    }
-
-  filled_before = true;
+    set_wall_memory(m, dim, coord);
+    filled_before[m] = true;
   }
 
   std::unordered_set<int> to_mask; //Local ids of neighboring atoms of each atom in question that will be masked because of being on an opposite side of the wall
@@ -372,8 +414,9 @@ void FixWallGhost::wall_particle(int m, double coord)
         if (std::abs(x[j][dim] - coord) > cutoff[m]) continue;
 
         if (mask[j] & groupbit){
-          //if ((x[i][dim] - coord < 0)^(x[j][dim] - coord < 0)){
-          if (rel2wall[m][27*(tag[i] - 1) + get_ghost_offset(x[i])] ^ rel2wall[m][27*(tag[j] - 1) + get_ghost_offset(x[j])]){
+          atm1 = rel2wall[m][(ghost_dimensions + 1)*(tag[i] - 1) + get_ghost_offset(x[i])];
+          atm2 = rel2wall[m][(ghost_dimensions + 1)*(tag[j] - 1) + get_ghost_offset(x[j])];
+          if ((atm1 != -1) && (atm2 != -1) && (atm1 ^ atm2)){
             to_mask.emplace(j);
           }
         }
@@ -397,14 +440,52 @@ void FixWallGhost::setup_pre_force(int vflag) {
 }
 
 int FixWallGhost::get_ghost_offset(double *atom_x){
-    // Determine the offset in each direction (dx, dy, dz)
+    // Determine ghost shifts in each direction
     int dx = (atom_x[0] < domain->boxlo[0]) ? -1 : ((atom_x[0] >= domain->boxhi[0]) ? 1 : 0);
     int dy = (atom_x[1] < domain->boxlo[1]) ? -1 : ((atom_x[1] >= domain->boxhi[1]) ? 1 : 0);
     int dz = (atom_x[2] < domain->boxlo[2]) ? -1 : ((atom_x[2] >= domain->boxhi[2]) ? 1 : 0);
 
-    // Encode the ghost offset into a single value from 0 to 26
-    int ghost_offset = (dx + 1) * 9 + (dy + 1) * 3 + (dz + 1);
+    // Define the valid ghost cells based on periodicity
+    const int all_periodic[] = {11, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26};
+    const int xy_periodic[] = {11, 13, 14, 16, 17};
+    const int xz_periodic[] = {13, 16, 19, 22, 25};
+    const int yz_periodic[] = {13, 14, 21, 22, 23};
+    const int x_periodic_only[] = {13, 16};
+    const int y_periodic_only[] = {13, 14};
+    const int z_periodic_only[] = {13, 22};
 
-    return ghost_offset;
+    // Choose the appropriate valid cell set
+    const int *valid_cells = nullptr;
+
+    if (!domain->boundary[0][0] && !domain->boundary[1][0] && !domain->boundary[2][0]) {
+        valid_cells = all_periodic;
+    } else if (!domain->boundary[0][0] && !domain->boundary[1][0]) {
+        valid_cells = xy_periodic;
+    } else if (!domain->boundary[0][0] && !domain->boundary[2][0]) {
+        valid_cells = xz_periodic;
+    } else if (!domain->boundary[1][0] && !domain->boundary[2][0]) {
+        valid_cells = yz_periodic;
+    } else if (!domain->boundary[0][0]) {
+        valid_cells = x_periodic_only;
+    } else if (!domain->boundary[1][0]) {
+        valid_cells = y_periodic_only;
+    } else if (!domain->boundary[2][0]) {
+        valid_cells = z_periodic_only;
+    } else {
+        return 0; // No periodicity, no ghost atoms
     }
+
+    // Compute the original 3D cell ID using LAMMPS-style indexing
+    int original_id = (dz + 1) * 9 + (dx + 1) * 3 + (dy + 1);
+
+    // Map the original ID to a compact index
+    for (int i = 0; i <= ghost_dimensions; i++) {
+        if (valid_cells[i] == original_id) {
+            return i; // Return compact index (0 to num_cells - 1)
+        }
+    }
+
+    return -1; // Should never happen if logic is correct
+}
+
 

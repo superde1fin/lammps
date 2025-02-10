@@ -12,29 +12,23 @@
 ------------------------------------------------------------------------- */
 
 #ifdef FIX_CLASS
-FixStyle(wall/ghost, FixWallGhost);
+FixStyle(wall/ghost/region, FixWallGhostRegion);
 #else
 
-#ifndef LMP_FIX_WALL_GHOST_H
-#define LMP_FIX_WALL_GHOST_H
+#ifndef LMP_FIX_WALL_GHOST_REGION_H
+#define LMP_FIX_WALL_GHOST_REGION_H
 
 #include "fix.h"
-#include <mpi.h>
+#include "region.h"
+#include <unordered_map>
+#include <unordered_set>
 
 namespace LAMMPS_NS {
 
-class FixWallGhost : public Fix {
+class FixWallGhostRegion : public Fix {
  public:
-  int nwall; //Counter storing the index of a wall while parsing command args
-  int wallwhich[6]; //Array with identifiers of wich side of the simulation region each wall refers to
-  double coord0[6]; //Array storing an offset for a specified side for each wall
-  int xstyle[6]; //Array storing type of coordinate specification: variable, constant or edge
-  int xindex[6]; //Array storing variable identifiers for future lookup of wall position values
-  char *xstr[6]; //Names of variables specifying position of each wall
-  enum { NONE = 0, EDGE, CONSTANT, VARIABLE };
-
-  FixWallGhost(class LAMMPS *, int, char **);
-  ~FixWallGhost() override;
+  FixWallGhostRegion(class LAMMPS *, int, char **);
+  ~FixWallGhostRegion() override;
   int setmask() override;
   void init() override;
   //Functions called before each run
@@ -46,15 +40,12 @@ class FixWallGhost : public Fix {
   void post_force(int) override;
   void post_force_respa(int, int, int) override;
   void min_post_force(int) override;
-
-  virtual void wall_particle(int, double); //Function called to evaluate each wall's effect on the particles in the system
+  bool (FixWallGhostRegion::*check_across)(double, double, double, double, double, double);
 
  protected:
   LAMMPS *lmp;
-  double cutoff[6]; //Cutoffs for wall particle interactions for each wall
-  int every[6]; //Array storing number of timesteps after which the wall neighborlists are reevaluated
-  double xscale, yscale, zscale;
-  int varflag;    // 1 if wall position is a variable
+  double cutoff; //Cutoff for wall particle interactions
+  int every; //Number of timesteps after which the wall neighborlist is reevaluated
   int ilevel_respa;
   int append_flag;
   int ghost_dimensions;
@@ -64,17 +55,19 @@ class FixWallGhost : public Fix {
   int *numneigh; //Array with number of neghbors for each local atom
   int **firstneigh; //2D array with neighbors of each local atom
 
+  char *idregion;
+  Region *region;
+
   double **x; //2D array with atomic positions
   int *mask; //Atomic mask array
   bigint initial_timestep; //Timestep on which a run began
-  bool *rel2wall[6]; //Array of pointers to boolean arrays that store information about the relative position of each atom (and its ghost atom copies) to the wall
-  bool *wall_save[6];
+  std::unordered_map<int, std::unordered_set<int>>* wall_save;
+  std::unordered_map<int, std::unordered_set<int>> rel2wall;
   int get_ghost_offset(double *); //Returns a unique identifier of the location of the atom copy in the 3x3x3 ghost atom simulation region multicell
-  bool filled_before[6]; //Array of flags that tells whether the wall memory array has been filled before
-  static void bitwise_or(void *invec, void *inoutvec, int *len, MPI_Datatype *datatype); // Declare static
-  void set_wall_memory(int, int, double); //Survey atom relative position to the wall side
-  tagint *tag;
-  MPI_Op mpi_bor_custom;
+  bool filled_before; //Flag that tells whether the wall memory array has been filled before
+
+  bool across_region(double, double, double, double, double, double);
+  bool across_partial_region(double, double, double, double, double, double);
 
 
 };

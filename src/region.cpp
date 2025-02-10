@@ -35,6 +35,7 @@ Region::Region(LAMMPS *lmp, int /*narg*/, char **arg) :
   id = utils::strdup(arg[0]);
   style = utils::strdup(arg[1]);
 
+  full_volume = 1;
   varshape = 0;
   xstr = ystr = zstr = tstr = nullptr;
   dx = dy = dz = 0.0;
@@ -132,7 +133,9 @@ int Region::match(double x, double y, double z)
 {
   if (dynamic) inverse_transform(x, y, z);
   if (openflag) return 1;
-  return !(inside(x, y, z) ^ interior);
+  int is_inside = inside(x, y, z);
+  if (is_inside != -1) return !(inside(x, y, z) ^ interior);
+  else return -1;
 }
 
 /* ----------------------------------------------------------------------
