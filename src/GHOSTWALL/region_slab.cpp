@@ -34,6 +34,8 @@ RegSlab::RegSlab(LAMMPS *lmp, int narg, char **arg) :
 
   options(narg - 14, &arg[14]);
 
+  full_volume = 0;
+
 
   int iarg = 2;
 
@@ -110,7 +112,7 @@ RegSlab::RegSlab(LAMMPS *lmp, int narg, char **arg) :
         s2ystyle = VARIABLE;
         varshape = 1;
       } else {
-        x_vec[1] = utils::numeric(FLERR, arg[iarg], false, lmp);
+        y_vec[1] = utils::numeric(FLERR, arg[iarg], false, lmp);
         s2ystyle = CONSTANT;
       }
       if (utils::strmatch(arg[++iarg], "^v_")) {
