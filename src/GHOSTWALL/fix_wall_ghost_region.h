@@ -88,6 +88,8 @@ class FixWallGhostRegion : public Fix {
   int size_restart(int);
   int pack_restart(int, double *);
   void unpack_restart(int, int);
+  void write_restart(FILE *);
+  void restart(char *);
 
   //Helper functions
   RelMap deserializeMap(const std::vector<int> &);

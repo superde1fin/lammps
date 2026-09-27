@@ -207,7 +207,12 @@ void FixWallGhostRegion::setup_post_neighbor(){
       region->openflag = prev_openflag;
 
 
-      all_atoms_count = (ghost_dimensions + 1)*atom->natoms; //Ensure all ghost atoms are included as well
+      tagint max_tag_system = 0;
+      for (int i = 0; i < atom->nlocal; i++) {
+            if (atom->tag[i] > max_tag_system) max_tag_system = atom->tag[i];
+      }
+      MPI_Allreduce(MPI_IN_PLACE, &max_tag_system, 1, MPI_LMP_TAGINT, MPI_MAX, lmp->world);
+      all_atoms_count = (ghost_dimensions + 1) * max_tag_system;  //Ensure all ghost atoms are included as well
       int *offsets; //Array with offsets at which antineighbors will be stored
       int *num_AN; //Array with a number of antineighbors
       int *key_tags; //Array with tags of each antineihbor key
@@ -249,7 +254,9 @@ void FixWallGhostRegion::setup_post_neighbor(){
 
       local_rel2wall.clear();
 
-      MPI_Allreduce(MPI_IN_PLACE, all_AN, total_AN, MPI_INT, MPI_SUM, lmp->world);
+      if (total_AN > 0){
+        MPI_Allreduce(MPI_IN_PLACE, all_AN, total_AN, MPI_INT, MPI_SUM, lmp->world);
+      }
       MPI_Allreduce(MPI_IN_PLACE, offsets, all_atoms_count, MPI_INT, MPI_SUM, lmp->world);
       MPI_Allreduce(MPI_IN_PLACE, num_AN, all_atoms_count, MPI_INT, MPI_SUM, lmp->world);
       MPI_Allreduce(MPI_IN_PLACE, key_tags, all_atoms_count, MPI_INT, MPI_SUM, lmp->world);
@@ -503,8 +510,11 @@ int FixWallGhostRegion::maxsize_restart(){
   int nmax = 0;
   int sz;
   for (int i = 0; i < atom->nlocal; i++){
-    sz = (*rel2wall)[atom->tag[i]].size();
-    if (sz > nmax) nmax = sz;
+	auto it = rel2wall->find(atom->tag[i]);
+	if (it != rel2wall->end()) {
+	  int sz = it->second.size();
+	  if (sz > nmax) nmax = sz;
+	}
   }
   MPI_Allreduce(MPI_IN_PLACE, &nmax, 1, MPI_INT, MPI_MAX, lmp->world);
   return nmax + 1;
@@ -517,15 +527,26 @@ int FixWallGhostRegion::size_restart(int i){
     return 1;
   }
 }
-
 int FixWallGhostRegion::pack_restart(int i, double *buf){
-  buf[0] = (*rel2wall)[atom->tag[i]].size() + 1;
+  auto it = rel2wall->find(atom->tag[i]);
+  
+  // If not found, write size 1 and return early.
+  if (it == rel2wall->end()) {
+        buf[0] = 1.0;
+        return 1;
+  }
+
+  int sz = it->second.size();
+  buf[0] = sz + 1;
   int m = 0;
-  for (const int neigh : (*rel2wall)[atom->tag[i]]){
+  
+  // Use the iterator to strictly read the map without mutating it
+  for (const int neigh : it->second){
     buf[++m] = static_cast<double>(neigh);
   }
-  return (*rel2wall)[atom->tag[i]].size() + 1;
+  return sz + 1;
 }
+
 
 void FixWallGhostRegion::unpack_restart(int local_ind, int saved_fix_ind){
   double **extra = atom->extra;
@@ -588,4 +609,16 @@ void FixWallGhostRegion::mergeMaps(std::shared_ptr<RelMap> local_map, const RelM
     for (const auto &entry : received_map) {
         (*local_map)[entry.first].insert(entry.second.begin(), entry.second.end());
     }
+}
+
+//Tell modify that the appended wall will not store any data
+void FixWallGhostRegion::write_restart(FILE *fp)
+{
+  int n = 0;
+  if (comm->me == 0) fwrite(&n, sizeof(int), 1, fp);
+}
+
+//Appended walls do not need to read any data
+void FixWallGhostRegion::restart(char *buf)
+{
 }
